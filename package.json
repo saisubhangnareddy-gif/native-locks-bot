@@ -1,0 +1,11 @@
+{
+  "name": "native-locks-escalation-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Thread-summariser + POC nudger + daily digest for Native Locks escalations, driven by the Native Locks Escalations Slack app.",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "local:nudge": "node -e \"require('./api/nudge')({headers:{},query:{}},{status:()=>({json:console.log})})\"",
+    "local:digest": "node -e \"require('./api/digest')({headers:{},query:{}},{status:()=>({json:console.log})})\""
+  }
+}

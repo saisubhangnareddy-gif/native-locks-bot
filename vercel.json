@@ -1,0 +1,16 @@
+{
+  "crons": [
+    {
+      "path": "/api/nudge",
+      "schedule": "30 5 * * *"
+    },
+    {
+      "path": "/api/nudge",
+      "schedule": "30 11 * * *"
+    },
+    {
+      "path": "/api/digest",
+      "schedule": "30 4 * * *"
+    }
+  ]
+}
