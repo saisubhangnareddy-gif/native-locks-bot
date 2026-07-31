@@ -11,23 +11,44 @@ module.exports = async function handler(req, res) {
   }
 
   const token = process.env.SLACK_BOT_TOKEN;
+  const channel = process.env.PRODUCT_CHANNEL_ID;
   try {
-    const r = await fetch("https://slack.com/api/auth.test", {
+    // 1. Identity + scopes
+    const authRes = await fetch("https://slack.com/api/auth.test", {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
-    // auth.test returns the granted scopes in a response header.
-    const scopes = r.headers.get("x-oauth-scopes");
-    const json = await r.json();
+    const scopes = authRes.headers.get("x-oauth-scopes");
+    const authJson = await authRes.json();
+
+    // 2. Raw conversations.history probe (small sample, no oldest filter)
+    const histRes = await fetch("https://slack.com/api/conversations.history", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ channel, limit: 5 }),
+    });
+    const histJson = await histRes.json();
+
+    const sample = (histJson.messages || []).slice(0, 5).map((m) => ({
+      type: m.type,
+      subtype: m.subtype || null,
+      ts: m.ts,
+      thread_ts: m.thread_ts || null,
+      reply_count: m.reply_count || 0,
+      latest_reply: m.latest_reply || null,
+      text_snippet: (m.text || "").slice(0, 40),
+    }));
+
     return res.status(200).json({
-      ok: json.ok,
-      bot_user_id: json.user_id,
-      bot_name: json.user,
-      team: json.team,
-      token_prefix: token ? token.slice(0, 12) + "…" : "MISSING",
+      auth_ok: authJson.ok,
+      bot_user_id: authJson.user_id,
       granted_scopes: scopes,
-      slack_error: json.error || null,
+      channel_probed: channel,
+      history_ok: histJson.ok,
+      history_error: histJson.error || null,
+      messages_returned: (histJson.messages || []).length,
+      sample,
     });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
