@@ -27,13 +27,13 @@ module.exports = async function handler(req, res) {
   if (!authorized(req)) return res.status(401).json({ error: "unauthorized" });
 
   const token = process.env.SLACK_BOT_TOKEN;
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  const model = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
   const channel = process.env.PRODUCT_CHANNEL_ID; // C07GZK9UKQW
   const mode = process.env.NUDGE_MODE || "draft";
 
   try {
-    const results = await scanChannel({ token, anthropicKey, model, channel });
+    const results = await scanChannel({ token, geminiKey, model, channel });
     const openNudges = results.filter((r) => r.nudgeText);
 
     if (mode === "auto") {
