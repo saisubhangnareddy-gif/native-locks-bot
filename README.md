@@ -5,7 +5,7 @@ channel, powered by the existing **Native Locks Escalations** Slack app.
 
 Two jobs:
 1. **Nudger** (`/api/nudge`) — scans threads with activity in the last 5 days, uses
-   Claude to decide (from thread text only) whether each escalation is closed. For
+   Gemini to decide (from thread text only) whether each escalation is closed. For
    open ones it figures out *what it's stuck on* and *who it's blocked on*, then
    drafts a nudge tagging that POC + asking for ETA/next step, always cc'ing you.
    Re-nudges the same POC (cc Sita Ram) if they didn't reply since the last nudge.
