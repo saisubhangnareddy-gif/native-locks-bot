@@ -40,15 +40,44 @@ module.exports = async function handler(req, res) {
       text_snippet: (m.text || "").slice(0, 40),
     }));
 
+    // 3. Replay the exact scanner fetch + filter to see where threads drop.
+    const now = Date.now() / 1000;
+    const activeSince = now - Number(process.env.LOOKBACK_DAYS || 5) * 86400;
+    const parentLookbackDays = Number(process.env.PARENT_LOOKBACK_DAYS || 60);
+    const parentOldest = (now - parentLookbackDays * 86400).toFixed(6);
+
+    const bigRes = await fetch("https://slack.com/api/conversations.history", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ channel, oldest: parentOldest, limit: 200, inclusive: true }),
+    });
+    const bigJson = await bigRes.json();
+    const all = bigJson.messages || [];
+    const passType = all.filter((m) => m.type === "message");
+    const passSubtype = passType.filter((m) => !m.subtype || m.subtype === "bot_message" || m.subtype === "thread_broadcast");
+    const passTs = passSubtype.filter((m) => m.ts && /^\d+\.\d+$/.test(m.ts));
+    const passRecency = passTs.filter((m) => Number(m.latest_reply || m.ts) >= activeSince);
+
     return res.status(200).json({
       auth_ok: authJson.ok,
-      bot_user_id: authJson.user_id,
       granted_scopes: scopes,
       channel_probed: channel,
       history_ok: histJson.ok,
       history_error: histJson.error || null,
       messages_returned: (histJson.messages || []).length,
       sample,
+      filter_replay: {
+        now,
+        activeSince,
+        parentOldest,
+        big_history_ok: bigJson.ok,
+        big_history_error: bigJson.error || null,
+        total_fetched: all.length,
+        pass_type: passType.length,
+        pass_subtype: passSubtype.length,
+        pass_ts: passTs.length,
+        pass_recency: passRecency.length,
+      },
     });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
