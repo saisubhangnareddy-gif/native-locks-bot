@@ -55,7 +55,7 @@ module.exports = async function handler(req, res) {
     const body = openNudges.length ? header + blocks.join("\n") : ":white_check_mark: No stuck threads found in the window.";
 
     await slackClient.dmUser(token, PEOPLE.SUBHANG, body);
-    return res.status(200).json({ mode, drafted: openNudges.length });
+    return res.status(200).json({ mode, drafted: openNudges.length, stats: results._stats });
   } catch (e) {
     return res.status(500).json({ error: String(e && e.stack ? e.stack : e) });
   }
