@@ -58,6 +58,23 @@ module.exports = async function handler(req, res) {
     const passTs = passSubtype.filter((m) => m.ts && /^\d+\.\d+$/.test(m.ts));
     const passRecency = passTs.filter((m) => Number(m.latest_reply || m.ts) >= activeSince);
 
+    // 4. Try fetching replies for each recency-passing candidate; report outcome.
+    const threadProbe = [];
+    for (const m of passRecency) {
+      const threadTs = m.thread_ts || m.ts;
+      try {
+        const rr = await fetch("https://slack.com/api/conversations.replies", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ channel, ts: threadTs, limit: 200 }),
+        });
+        const rj = await rr.json();
+        threadProbe.push({ threadTs, ok: rj.ok, error: rj.error || null, msgs: (rj.messages || []).length });
+      } catch (e) {
+        threadProbe.push({ threadTs, ok: false, error: String(e), msgs: 0 });
+      }
+    }
+
     return res.status(200).json({
       auth_ok: authJson.ok,
       granted_scopes: scopes,
@@ -78,6 +95,7 @@ module.exports = async function handler(req, res) {
         pass_ts: passTs.length,
         pass_recency: passRecency.length,
       },
+      thread_probe: threadProbe,
     });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
