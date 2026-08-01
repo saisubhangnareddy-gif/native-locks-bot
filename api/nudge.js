@@ -35,6 +35,12 @@ module.exports = async function handler(req, res) {
   try {
     const results = await scanChannel({ token, groqKey, model, channel });
     const openNudges = results.filter((r) => r.nudgeText);
+    const st = results._stats || {};
+
+    // Loud warning if we did NOT analyze every active thread this run.
+    const coverageWarn = !st.coverageComplete
+      ? `:warning: *INCOMPLETE COVERAGE* — analyzed only ${st.analyzed}/${st.fetchedThreads} active threads this run (time budget hit). ${st.fetchedThreads - st.analyzed} thread(s) were NOT checked. Do not rely on this run as complete; re-run or reduce lookback.\n\n`
+      : "";
 
     if (mode === "auto") {
       const posted = [];
@@ -43,19 +49,21 @@ module.exports = async function handler(req, res) {
         await recordNudge(channel, r);
         posted.push(r.permalink);
       }
-      return res.status(200).json({ mode, posted: posted.length, results: posted });
+      // If coverage was incomplete, DM Subhang so a gap is never silent.
+      if (coverageWarn) await slackClient.dmUser(token, PEOPLE.SUBHANG, coverageWarn);
+      return res.status(200).json({ mode, posted: posted.length, results: posted, stats: st });
     }
 
     // draft mode: DM Subhang a single digest of proposed nudges for approval.
-    const header = `:eyes: *Proposed escalation nudges* — ${openNudges.length} thread(s) look stuck (last ${process.env.LOOKBACK_DAYS || 5} days).\nReply-review before I post. Approve by switching NUDGE_MODE=auto, or nudge manually.\n`;
+    const header = `:eyes: *Proposed escalation nudges* — ${openNudges.length} stuck of ${st.analyzed}/${st.fetchedThreads} active threads (last ${process.env.LOOKBACK_DAYS || 3} days).\nReply-review before I post. Approve by switching NUDGE_MODE=auto, or nudge manually.\n`;
     const blocks = openNudges.map((r, i) => {
       const tag = r.isRenudge ? " *(RE-NUDGE — no reply since last time; Sita cc'd)*" : "";
       return `\n*${i + 1}.* <${r.permalink}|open thread>${tag}\n_Draft:_\n${r.nudgeText}`;
     });
-    const body = openNudges.length ? header + blocks.join("\n") : ":white_check_mark: No stuck threads found in the window.";
+    const body = coverageWarn + (openNudges.length ? header + blocks.join("\n") : ":white_check_mark: No stuck threads found in the window.");
 
     await slackClient.dmUser(token, PEOPLE.SUBHANG, body);
-    return res.status(200).json({ mode, drafted: openNudges.length, stats: results._stats });
+    return res.status(200).json({ mode, drafted: openNudges.length, stats: st });
   } catch (e) {
     return res.status(500).json({ error: String(e && e.stack ? e.stack : e) });
   }
