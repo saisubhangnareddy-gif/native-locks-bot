@@ -24,14 +24,14 @@ module.exports = async function handler(req, res) {
   if (!authorized(req)) return res.status(401).json({ error: "unauthorized" });
 
   const token = process.env.SLACK_BOT_TOKEN;
-  const geminiKey = process.env.GEMINI_API_KEY;
-  const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+  const groqKey = process.env.GROQ_API_KEY;
+  const model = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
   const channel = process.env.PRODUCT_CHANNEL_ID;      // C07GZK9UKQW
   const digestChannel = process.env.DIGEST_CHANNEL_ID;  // C0BM587169G
   const mode = process.env.DIGEST_MODE || "draft";
 
   try {
-    const results = await scanChannel({ token, geminiKey, model, channel });
+    const results = await scanChannel({ token, groqKey, model, channel });
     const text = buildDigest(results, { channelName: "native-lock-product-issues" });
 
     if (mode === "auto") {
