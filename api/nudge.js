@@ -22,15 +22,24 @@ function authorized(req) {
   return auth === `Bearer ${secret}` || key === secret;
 }
 
-// Fire the next batch without awaiting it, so this invocation can return.
-function chainNextBatch(req) {
+// Fire the next batch. We AWAIT the request kickoff (with a short timeout) so
+// the outbound connection is established before this invocation is frozen;
+// we don't wait for the next batch to finish.
+async function chainNextBatch(req) {
   try {
     const proto = (req.headers["x-forwarded-proto"] || "https");
     const host = req.headers["host"];
     const secret = process.env.CRON_SECRET || "";
     const url = `${proto}://${host}/api/nudge?key=${encodeURIComponent(secret)}&chained=1`;
-    // Don't await — we only need to kick it off.
-    fetch(url, { method: "GET" }).catch(() => {});
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 2500);
+    try {
+      await fetch(url, { method: "GET", signal: ctrl.signal });
+    } catch {
+      // Aborting after kickoff is expected; the next batch keeps running server-side.
+    } finally {
+      clearTimeout(t);
+    }
   } catch {}
 }
 
@@ -39,7 +48,7 @@ module.exports = async function handler(req, res) {
 
   const token = process.env.SLACK_BOT_TOKEN;
   const groqKey = process.env.GROQ_API_KEY;
-  const model = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+  const model = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
   const channel = process.env.PRODUCT_CHANNEL_ID; // C07GZK9UKQW
   const mode = process.env.NUDGE_MODE || "draft";
   const isChained = req.query && req.query.chained === "1";
@@ -50,7 +59,7 @@ module.exports = async function handler(req, res) {
     const st = results._stats || {};
 
     // If more active threads remain in this cycle, kick off the next batch now.
-    if (st.remaining > 0) chainNextBatch(req);
+    if (st.remaining > 0) await chainNextBatch(req);
 
     if (mode === "auto") {
       const posted = [];
