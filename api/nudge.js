@@ -26,13 +26,14 @@ module.exports = async function handler(req, res) {
   if (!authorized(req)) return res.status(401).json({ error: "unauthorized" });
 
   const token = process.env.SLACK_BOT_TOKEN;
-  const groqKey = process.env.GROQ_API_KEY;
-  const model = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+  const provider = (process.env.LLM_PROVIDER || "mistral").toLowerCase();
+  const apiKey = provider === "mistral" ? process.env.MISTRAL_API_KEY : process.env.GROQ_API_KEY;
+  const model = process.env.LLM_MODEL || (provider === "mistral" ? "mistral-medium-latest" : "llama-3.1-8b-instant");
   const channel = process.env.PRODUCT_CHANNEL_ID; // C07GZK9UKQW
   const mode = process.env.NUDGE_MODE || "draft";
 
   try {
-    const results = await scanChannel({ token, groqKey, model, channel });
+    const results = await scanChannel({ token, apiKey, model, provider, channel });
     const openNudges = results.filter((r) => r.nudgeText);
     const st = results._stats || {};
 
