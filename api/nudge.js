@@ -22,9 +22,10 @@ function authorized(req) {
   return auth === `Bearer ${secret}` || key === secret;
 }
 
-// Fire the next batch. We AWAIT the request kickoff (with a short timeout) so
-// the outbound connection is established before this invocation is frozen;
-// we don't wait for the next batch to finish.
+// Fire the next run to continue the sweep if threads remain. Best-effort:
+// we await the kickoff briefly; if it doesn't land, the scheduled crons and
+// manual re-runs still drain the remaining pending threads (nothing is lost —
+// pending threads persist in KV until analyzed).
 async function chainNextBatch(req) {
   try {
     const proto = (req.headers["x-forwarded-proto"] || "https");
@@ -32,14 +33,9 @@ async function chainNextBatch(req) {
     const secret = process.env.CRON_SECRET || "";
     const url = `${proto}://${host}/api/nudge?key=${encodeURIComponent(secret)}&chained=1`;
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 2500);
-    try {
-      await fetch(url, { method: "GET", signal: ctrl.signal });
-    } catch {
-      // Aborting after kickoff is expected; the next batch keeps running server-side.
-    } finally {
-      clearTimeout(t);
-    }
+    const t = setTimeout(() => ctrl.abort(), 3000);
+    try { await fetch(url, { method: "GET", signal: ctrl.signal }); }
+    catch {} finally { clearTimeout(t); }
   } catch {}
 }
 
