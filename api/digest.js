@@ -1,14 +1,15 @@
 // ============================================================================
-// /api/digest — the 10am daily summary.
+// /api/digest — the morning summary.
 //
-// Scans the product channel, builds a categorized digest (Critical first,
-// then product issues by blocker with POCs + thread links), and:
+// Reads the OPEN-escalation records the nudger accumulated in KV during its
+// chunked sweeps (so the digest reflects the FULL channel, not a single batch),
+// then builds a categorized summary.
 //   mode "draft" -> DMs the digest to Subhang for review.
 //   mode "auto"  -> posts to #pending-escalations-summariser (C0BM587169G).
 // ============================================================================
 
-const { scanChannel } = require("../lib/scanner");
 const { buildDigest } = require("../lib/digest");
+const { getAllOpenEscalations } = require("../lib/nudge");
 const slackClient = require("../lib/slack");
 const { PEOPLE } = require("../lib/poc-map");
 
@@ -24,22 +25,20 @@ module.exports = async function handler(req, res) {
   if (!authorized(req)) return res.status(401).json({ error: "unauthorized" });
 
   const token = process.env.SLACK_BOT_TOKEN;
-  const groqKey = process.env.GROQ_API_KEY;
-  const model = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
   const channel = process.env.PRODUCT_CHANNEL_ID;      // C07GZK9UKQW
   const digestChannel = process.env.DIGEST_CHANNEL_ID;  // C0BM587169G
   const mode = process.env.DIGEST_MODE || "draft";
 
   try {
-    const results = await scanChannel({ token, groqKey, model, channel });
-    const text = buildDigest(results, { channelName: "native-lock-product-issues" });
+    const openRecords = await getAllOpenEscalations(channel);
+    const text = buildDigest(openRecords, { channelName: "native-lock-product-issues" });
 
     if (mode === "auto") {
       await slackClient.postMessage(token, digestChannel, text);
-      return res.status(200).json({ mode, posted: true, open: results.filter((r) => r.nudgeText).length });
+      return res.status(200).json({ mode, posted: true, open: openRecords.length });
     }
     await slackClient.dmUser(token, PEOPLE.SUBHANG, `:memo: *Draft digest* (would post to #pending-escalations-summariser):\n\n${text}`);
-    return res.status(200).json({ mode, drafted: true });
+    return res.status(200).json({ mode, drafted: true, open: openRecords.length });
   } catch (e) {
     return res.status(500).json({ error: String(e && e.stack ? e.stack : e) });
   }
