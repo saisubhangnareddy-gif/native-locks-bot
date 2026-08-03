@@ -28,7 +28,7 @@ module.exports = async function handler(req, res) {
   const token = process.env.SLACK_BOT_TOKEN;
   const provider = (process.env.LLM_PROVIDER || "mistral").toLowerCase();
   const apiKey = provider === "mistral" ? process.env.MISTRAL_API_KEY : process.env.GROQ_API_KEY;
-  const model = process.env.LLM_MODEL || (provider === "mistral" ? "mistral-medium-latest" : "llama-3.1-8b-instant");
+  const model = process.env.LLM_MODEL || (provider === "mistral" ? "mistral-medium-2508" : "llama-3.1-8b-instant");
   const channel = process.env.PRODUCT_CHANNEL_ID; // C07GZK9UKQW
   const mode = process.env.NUDGE_MODE || "draft";
 
