@@ -13,7 +13,7 @@
 const { scanChannel, recordNudge } = require("../lib/scanner");
 const slackClient = require("../lib/slack");
 const { analyzeThread } = require("../lib/stuck-detector");
-const { composeNudge, extractHandoff, getNudgeState, isRenudge } = require("../lib/nudge");
+const { composeNudge, getNudgeState, isRenudge } = require("../lib/nudge");
 const { PEOPLE } = require("../lib/poc-map");
 
 function authorized(req) {
@@ -50,8 +50,7 @@ async function debugOneThread({ token, apiKey, model, provider, channel, threadT
   }
   const prev = await getNudgeState(channel, threadTs);
   const renudge = isRenudge(prev, messages);
-  const handoffOverride = extractHandoff(messages);
-  const { text } = composeNudge({ analysis, isRenudge: renudge, participants, handoffOverride });
+  const { text } = composeNudge({ analysis, isRenudge: renudge, participants });
 
   // Resolve @IDs to names so the preview is readable without opening Slack.
   // Fall back to the POC map for people who didn't post in the thread (so
