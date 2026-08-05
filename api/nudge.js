@@ -53,7 +53,11 @@ async function debugOneThread({ token, apiKey, model, provider, channel, threadT
   const { text } = composeNudge({ analysis, isRenudge: renudge, participants });
 
   // Resolve @IDs to names so the preview is readable without opening Slack.
-  const readable = text.replace(/<@([A-Z0-9]+)>/g, (_, id) => `@${nameMap[id] || id}`);
+  // Fall back to the POC map for people who didn't post in the thread (so
+  // cc'd leads like Kunal show a name, not a raw U-id — preview only).
+  const pocNameById = {};
+  for (const [k, id] of Object.entries(PEOPLE)) pocNameById[id] = k;
+  const readable = text.replace(/<@([A-Z0-9]+)>/g, (_, id) => `@${nameMap[id] || pocNameById[id] || id}`);
   return res.status(200).json({ threadTs, status: "open", isRenudge: renudge, analysis, nudgeText: text, preview: readable });
 }
 
