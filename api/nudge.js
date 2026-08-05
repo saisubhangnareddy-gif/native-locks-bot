@@ -50,7 +50,7 @@ async function debugOneThread({ token, apiKey, model, provider, channel, threadT
   }
   const prev = await getNudgeState(channel, threadTs);
   const renudge = isRenudge(prev, messages);
-  const { text } = composeNudge({ analysis, isRenudge: renudge, participants });
+  const { text } = composeNudge({ analysis, isRenudge: renudge, participants, messages });
 
   // Resolve @IDs to names so the preview is readable without opening Slack.
   // Fall back to the POC map for people who didn't post in the thread (so
