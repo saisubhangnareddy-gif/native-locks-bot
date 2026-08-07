@@ -43,14 +43,19 @@ async function debugOneThread({ token, apiKey, model, provider, channel, threadT
   }
 
   const participants = {};
+  const blockedIds = [];
+  const BLOCK_NAMES = ["titas"];
   for (const m of messages) {
     if (!m.user) continue;
     const nm = nameOf(m.user);
-    if (nm) participants[nm.toLowerCase().trim()] = m.user;
+    if (!nm) continue;
+    const low = nm.toLowerCase().trim();
+    if (BLOCK_NAMES.some((b) => low.includes(b))) { blockedIds.push(m.user); continue; }
+    participants[low] = m.user;
   }
   const prev = await getNudgeState(channel, threadTs);
   const renudge = isRenudge(prev, messages);
-  const { text } = composeNudge({ analysis, isRenudge: renudge, participants, messages });
+  const { text } = composeNudge({ analysis, isRenudge: renudge, participants, messages, blockedIds });
 
   // Resolve @IDs to names so the preview is readable without opening Slack.
   // Fall back to the POC map for people who didn't post in the thread (so
