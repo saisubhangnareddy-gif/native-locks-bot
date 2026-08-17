@@ -55,7 +55,12 @@ async function debugOneThread({ token, apiKey, model, provider, channel, threadT
   }
   const prev = await getNudgeState(channel, threadTs);
   const renudge = isRenudge(prev, messages);
-  const { text } = composeNudge({ analysis, isRenudge: renudge, participants, messages, blockedIds });
+  // Same "no message since last nudge" check the scanner uses (preview accuracy).
+  let actionOnly = false;
+  if (prev && prev.lastNudgeTs) {
+    actionOnly = !messages.some((m) => m.user && Number(m.ts) > Number(prev.lastNudgeTs));
+  }
+  const { text } = composeNudge({ analysis, isRenudge: renudge, actionOnly, participants, messages, blockedIds });
 
   // Resolve @IDs to names so the preview is readable without opening Slack.
   // Fall back to the POC map for people who didn't post in the thread (so
