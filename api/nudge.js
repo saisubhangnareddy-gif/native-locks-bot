@@ -125,6 +125,14 @@ module.exports = async function handler(req, res) {
     if (openNudges.length) {
       await slackClient.dmUser(token, PEOPLE.SUBHANG, header + blocks.join("\n"));
     }
+    // Record nudge state in DRAFT mode too. Without this, lastNudgeTs / cooldown /
+    // isRenudge / the 3-strike streak are never persisted, so the same thread gets
+    // re-drafted every run and the stop/cooldown logic can never fire. Recording
+    // here makes draft behave like auto (minus the actual channel post), so what
+    // you review in draft matches what will post live.
+    for (const r of openNudges) {
+      try { await recordNudge(channel, r); } catch {}
+    }
     return res.status(200).json({ mode, drafted: openNudges.length, stats: st });
   } catch (e) {
     return res.status(500).json({ error: String(e && e.stack ? e.stack : e) });
