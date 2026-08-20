@@ -56,9 +56,21 @@ async function debugOneThread({ token, apiKey, model, provider, channel, threadT
   const prev = await getNudgeState(channel, threadTs);
   const renudge = isRenudge(prev, messages);
   // Same "no message since last nudge" check the scanner uses (preview accuracy).
+  // Exclude the bot's OWN nudge posts (match nudge text; keep intake headers).
+  const OUR_NUDGE_RE = /(\*Action needed\*|Escalation summary|:lock: \*CRITICAL|:rotating_light: \*CRITICAL|to move this forward)/i;
+  const INTAKE_HEADER_RE = /\b(raise a product issue|pod escalation time|issue bucket|customer request id|root request id)\b/i;
+  const isBotNudge = (m) => m && m.text && !INTAKE_HEADER_RE.test(m.text) && OUR_NUDGE_RE.test(m.text);
+  // Ground-truth trailing nudge count (same logic the scanner stops on).
+  let trailingNudges = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const t = (messages[i] && messages[i].text || "").trim();
+    if (!t) continue;
+    if (isBotNudge(messages[i])) { trailingNudges++; continue; }
+    break;
+  }
   let actionOnly = false;
   if (prev && prev.lastNudgeTs) {
-    actionOnly = !messages.some((m) => m.user && Number(m.ts) > Number(prev.lastNudgeTs));
+    actionOnly = !messages.some((m) => m.user && Number(m.ts) > Number(prev.lastNudgeTs) && !isBotNudge(m));
   }
   const { text } = composeNudge({ analysis, isRenudge: renudge, actionOnly, participants, messages, blockedIds });
 
@@ -68,7 +80,20 @@ async function debugOneThread({ token, apiKey, model, provider, channel, threadT
   const pocNameById = {};
   for (const [k, id] of Object.entries(PEOPLE)) pocNameById[id] = k;
   const readable = text.replace(/<@([A-Z0-9]+)>/g, (_, id) => `@${nameMap[id] || pocNameById[id] || id}`);
-  return res.status(200).json({ threadTs, status: "open", isRenudge: renudge, analysis, nudgeText: text, preview: readable });
+  // Debug: expose the stored nudge state + streak math so we can see WHY the
+  // 3-strike stop did or didn't fire for this thread.
+  const _debug = {
+    trailingNudges,
+    wouldStop: trailingNudges >= Number(process.env.MAX_UNANSWERED_NUDGES || 3),
+    storedState: prev || null,
+    consecutiveNoReply_stored: prev ? (prev.consecutiveNoReply ?? null) : null,
+    lastNudgeTs: prev ? (prev.lastNudgeTs || null) : null,
+    lastMessageTs: messages.length ? messages[messages.length - 1].ts : null,
+    humanSinceLastNudge: prev && prev.lastNudgeTs
+      ? messages.some((m) => m.user && Number(m.ts) > Number(prev.lastNudgeTs) && !isBotNudge(m))
+      : null,
+  };
+  return res.status(200).json({ threadTs, status: "open", isRenudge: renudge, analysis, nudgeText: text, preview: readable, _debug });
 }
 
 module.exports = async function handler(req, res) {
