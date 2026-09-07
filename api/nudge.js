@@ -41,6 +41,12 @@ async function debugOneThread({ token, apiKey, model, provider, channel, threadT
   if (analysis.status === "closed") {
     return res.status(200).json({ threadTs, status: "closed", analysis });
   }
+  if (analysis.status === "parked") {
+    return res.status(200).json({ threadTs, status: "parked", analysis });
+  }
+  if (analysis.status === "error") {
+    return res.status(200).json({ threadTs, status: "error", analysis, note: "LLM response failed to parse — no nudge would be sent." });
+  }
 
   const participants = {};
   const blockedIds = [];
