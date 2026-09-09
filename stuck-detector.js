@@ -1,0 +1,678 @@
+// ============================================================================
+// STUCK DETECTOR — the brain of the bot.
+//
+// For each thread it takes the FULL context (escalation root message + every
+// reply, in order) and asks an LLM to decide, purely from thread text:
+//   - is this escalation CLOSED (resolved / revisit done / replacement
+//     delivered / spare delivered / customer confirmed OK)?  -> skip
+//   - if OPEN, what is it stuck ON, and who is it blocked on?
+//
+// No sheets, no external state — thread text is the only source of truth
+// (per your instruction).
+// ============================================================================
+
+const { BLOCKERS, CRITICAL_SIGNALS, PEOPLE } = require("./poc-map");
+
+// A message that is the nudger bot's OWN NUDGE post. These must be IGNORED when
+// finding the "last substantive message" and when scanning the tail — otherwise
+// the bot's own "please … to move this forward" nudge text trips the attention/
+// needs-reply checks and blocks parking / closure.
+//
+// CRITICAL: match the NUDGE TEXT SHAPE, not merely bot_id / the bot user id. The
+// SAME bot app also posts the ESCALATION INTAKE HEADERS ("Raise a Product Issue",
+// "POD escalation time", "Issue Bucket", "Customer Request ID") — those are NOT
+// nudges and MUST be kept, because the multi-escalation slicer relies on them to
+// find the latest escalation block. So a bot message counts as OUR-NUDGE only if
+// it looks like a nudge AND is not an intake header.
+const OUR_NUDGE_RE = /(\*Action needed\*|Escalation summary|:lock: \*CRITICAL|:rotating_light: \*CRITICAL|to move this forward)/i;
+const INTAKE_HEADER_RE = /\b(raise a product issue|pod escalation time|poc escalation time|issue bucket|customer request id|root request id)\b/i;
+function isOurNudge(m) {
+  if (!m || !m.text) return false;
+  if (INTAKE_HEADER_RE.test(m.text)) return false;   // intake header — keep it
+  return OUR_NUDGE_RE.test(m.text);
+}
+function isBotMsg(m) {
+  return isOurNudge(m);
+}
+
+// A META message: a human talking ABOUT the nudger/bot itself, not about the
+// escalation — e.g. "how to get the summary messages to stop", "is saying
+// 'resolved' good enough?", "make the nudge stop", "@Subhang fix this bot".
+// These must be IGNORED entirely: they are not escalation activity, must not
+// count as a reopen (even though they often contain a "?"), and must not be the
+// "last substantive message". Kept narrow (nudge/summary/reminder-about-bot
+// phrasing) so real escalation messages are never stripped.
+const META_RE = /\b(summary messages?|these (summary )?messages|nudge messages?|the nudger|stop (the )?(summary|nudge|reminder|bot)s?|how (to|do i|do we)[^\n]{0,25}(stop|get)[^\n]{0,20}(summary|nudge|message|reminder)|is (saying|typing)[^\n]{0,20}good enough|reply(ing)?[^\n]{0,15}resolved[^\n]{0,15}(enough|stop|work))\b/i;
+function isMetaMsg(m) {
+  return !!(m && m.text && META_RE.test(m.text));
+}
+
+// Deterministic critical pre-scan on raw thread text (cheap safety net so we
+// never miss a lockout / legal threat even if the LLM is unsure).
+function scanCritical(threadText) {
+  const t = threadText.toLowerCase();
+  const hits = [];
+  for (const [key, def] of Object.entries(CRITICAL_SIGNALS)) {
+    if (def.keywords.some((k) => t.includes(k))) hits.push(key);
+  }
+  // LOCKOUT is critical ONLY while the customer is still locked out — i.e.
+  // BEFORE the resolution path (replacement / new-lock + refund) begins.
+  // Once that is underway — replacement OR return/refund flow: any sheet filled,
+  // approved, dispatched, reverse/return pickup aligned or done, tracking shared,
+  // post-replacement RCA — the customer is no longer stuck outside; drop the
+  // lockout critical. (Social-media/legal criticals are NOT stage-gated.)
+  if (hits.includes("lockout")) {
+    const pastReplacement = /(sheet fill|sheet filled|replacement approved|replacement.*deliver|deliver.*replacement|reverse pick|return pick|return sheet|refund|pick.*after replacement|tracking id|tracking \d|pickup done|pickup confirmed|proms for rca|replacement done|replacement lock installed|new lock|purchased.*lock)/i.test(t);
+    if (pastReplacement) {
+      const i = hits.indexOf("lockout");
+      hits.splice(i, 1);
+    }
+  }
+  return hits;
+}
+
+// Soft severity flag: the thread explicitly calls itself a "critical case" or a
+// VSAT case (an ops-severity marker), WITHOUT a true lockout/legal trigger.
+// We surface this as a visible note but do NOT fire the red banner or add the
+// critical POCs/cc (per instruction: flag it, don't escalate).
+function scanSoftFlag(threadText) {
+  const t = threadText.toLowerCase();
+  if (t.includes("critical case")) return "marked critical in-thread";
+  if (/\bvsat\b/.test(t)) return "VSAT case flagged in-thread";
+  return null;
+}
+
+// Deterministic withdrawal detector: a message clearly retracting the
+// escalation ("please ignore", "pls ignore this", "raised by mistake",
+// "duplicate ticket", "ignore this ticket/case/escalation"). Conservative
+// phrasing to avoid false positives like "ignore the notification". Checked
+// against the LAST message only — a withdrawal is the current state, and this
+// avoids closing a thread that was later reopened.
+const WITHDRAWN_RE = /\b(please ignore|pls ignore|ignore this (ticket|case|escalation|request)|raised by mistake|duplicate (ticket|case|escalation)|please close this|kindly ignore)\b/i;
+function isWithdrawn(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false;
+  const last = messages[messages.length - 1];
+  const lastText = (last && last.text) || "";
+  // Also allow the second-to-last, since a bot/system row can trail a real msg.
+  const prev = messages.length >= 2 ? (messages[messages.length - 2].text || "") : "";
+  return WITHDRAWN_RE.test(lastText) || WITHDRAWN_RE.test(prev);
+}
+
+// Deterministic resolution detector: the LAST substantive message clearly states
+// the issue is resolved / done / working. Checked only at the tail so a
+// mid-thread "resolved" that was later reopened doesn't wrongly close it.
+// Conservative — requires an explicit resolution statement, not just "fixed the
+// hub" mid-flow.
+const RESOLVED_RE = /\b(issue (resolved|solved)|successfully (resolved|solved)|(resolved|solved).*(px visited|visit done)|(px visited|visit done).*(resolved|solved)|issue (has been|is|was)[\w\s]{0,30}(resolved|solved)|cx('s)? issue[\w\s]{0,30}(resolved|solved)|cx confirmed.*(resolved|solved|working|fine)|working (fine|now|properly|correctly)|lock is (now )?working|case closed|now (resolved|solved)|problem (is |was |has been )?(resolved|solved)|take (a )?clos(ure|er)|please close this case|cx arranged.*(carpenter|technician).*(changed|replaced|fixed|installed))\b/i;
+// A SHORT tail message that is essentially just a close confirmation — the team
+// closes threads with "resolved" / "closed" / "this is resolved" / "it's fixed".
+// A long sentence that merely mentions "resolved" mid-flow must NOT match (length
+// guard below). Matches: bare "resolved"/"closed"/"resolved ✅"/"issue closed",
+// AND a short subject-led close like "this is resolved", "it's resolved now",
+// "case closed", "the issue has been fixed", "issue is resolved", "now resolved".
+const STANDALONE_CLOSE_RE = /^[\s>*_~`]*(yes[,!.\s]+)?((this|it|its|it's|that|case|the case|the issue|issue|lock|problem|everything|all)\s+(is|was|were|has been|have been|been|got|now|now is)?\s*)?(resolved?|solved|closed|fixed|sorted|working (fine|well|now|properly)|done and (resolved?|solved|closed)|closing this|closure)([\s.,!✅✔️🔒👍🙏]|and\s+(closed|working)|,?\s*(closed|resolved?|solved|working)|\s+now|\s+well)*[\s>*_~`]*$/i;
+function isStandaloneClose(text) {
+  const stripped = String(text || "").replace(/[<][^>]*[>]/g, "").trim();
+  if (!stripped) return false;
+  // CNR closure: an agent closing the ticket because the customer wasn't
+  // reachable — "closed on cnr", "closing on cnr", "closed due to cnr",
+  // "cx cnr, closed". Requires BOTH a clos* verb AND cnr together, so a bare
+  // mid-thread "cx cnr" (just "unreachable") does NOT wrongly close the thread.
+  if (/\bclos(ed|ing|e)\b[^\n]{0,15}\bcnr\b/i.test(stripped) || /\bcnr\b[^\n]{0,15}\bclos(ed|ing|e)\b/i.test(stripped)) return true;
+  // Guard: only treat SHORT messages as a bare close so we don't catch a long
+  // update that happens to contain the word "resolved".
+  if (stripped.length > 45) return false;
+  return STANDALONE_CLOSE_RE.test(stripped);
+}
+// A REOPEN signal: after a "resolved" message, only these bring the thread back
+// to life — a new escalation header, a new problem report, or a question. Plain
+// acknowledgements ("thanks", "ok", "great", "noted") do NOT reopen it.
+const REOPEN_RE = /\?|\b(raise a product issue|pod escalation time|issue bucket|not working|still (not|facing|getting|an issue|happening)|issue persists|again facing|facing (the )?(issue|problem|same)|new issue|another issue|reopen|not resolved|problem again|happening again|same issue|cx (is )?(angry|upset|complain|facing)|not fixed|didn'?t work|doesn'?t work|still pending|please help|need help|help here|any update)\b/i;
+function isResolvedTail(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false;
+  // RULE: a "resolved"/close message stops nudging — wherever it appears — UNLESS
+  // a later message is a genuine REOPEN (new escalation / new problem / question).
+  // Find the LAST close message in the whole thread, then scan everything AFTER
+  // it: if nothing reopens it, the thread is closed. (Bot nudges were already
+  // stripped upstream, so trailing bot rows don't interfere.)
+  let lastCloseIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const tx = (messages[i] && messages[i].text) || "";
+    if (RESOLVED_RE.test(tx) || isStandaloneClose(tx)) { lastCloseIdx = i; break; }
+  }
+  if (lastCloseIdx === -1) return false;
+  // Anything AFTER the close that reopens it?
+  for (let i = lastCloseIdx + 1; i < messages.length; i++) {
+    const tx = (messages[i] && messages[i].text) || "";
+    if (REOPEN_RE.test(tx)) return false;   // reopened — keep nudging
+  }
+  return true;   // closed and not reopened
+}
+
+// IMAGE / PROOF REQUEST FULFILLED (park). A very common loop: someone asks
+// "@X please share the sticker/lock-box images / photos / proofs / POW", and a
+// LATER message posts FILE ATTACHMENTS — that IS the fulfillment. Because tickets
+// get reassigned, the person who uploads may differ from who was asked, so we key
+// off the ATTACHMENTS (m.files), not the author. If the tail shows an image/proof
+// request AND a later message carries files, the ask is satisfied — stop nudging
+// for it until a new message raises something. Park unless the last message needs
+// attention (a fresh question / new problem).
+const IMAGE_REQUEST_RE = /\b(share|send|upload|provide|attach)\b[^\n]{0,60}\b(image|images|images'?|photo|photos|pic|pics|picture|pictures|sticker|stickers|sticker'?s|screenshot|screenshots|proof|proofs|pow|video|videos)\b/i;
+function isImageRequestFulfilledTail(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false;
+  const start = Math.max(0, messages.length - 6);
+  // Find the most recent image/proof request in the tail.
+  let reqIdx = -1;
+  for (let i = messages.length - 1; i >= start; i--) {
+    const tx = (messages[i] && messages[i].text) || "";
+    if (IMAGE_REQUEST_RE.test(tx)) { reqIdx = i; break; }
+  }
+  if (reqIdx === -1) return false;
+  // Any message AFTER the request that carries file attachments → fulfilled.
+  for (let i = reqIdx + 1; i < messages.length; i++) {
+    const m = messages[i];
+    if (m && Array.isArray(m.files) && m.files.length) {
+      // But if a later message raises a fresh question / new problem, stay open.
+      const lastText = (messages[messages.length - 1] || {}).text || "";
+      if (REOPEN_RE.test(lastText)) return false;
+      return true;
+    }
+  }
+  return false;
+}
+
+// The LAST message is a bare "visit done" / "px visited" — the pending revisit
+// actually happened. We don't know for certain it fixed the issue, so this is
+// NEAR-CLOSURE (ask to confirm), not hard-closed. Prevents re-nudging "create
+// the revisit" when the revisit is already complete.
+const VISIT_DONE_RE = /\b(visit done|px visited|revisit done|visit completed|px visit done|installation done|installed successfully)\b/i;
+// Signals that work is still incomplete despite a "visit done" — if these
+// appear at/near the tail, do NOT treat it as near-closure.
+const INCOMPLETE_RE = /\b(out of (the )?city|will reschedule|reschedule the visit|uninstallation pending|pickup pending|not installed|still pending|cx cnr|not available)\b/i;
+function isVisitDoneTail(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false;
+  const lastText = (messages[messages.length - 1] || {}).text || "";
+  if (!VISIT_DONE_RE.test(lastText)) return false;
+  // If the same last message also flags incompleteness, it's not closure.
+  if (INCOMPLETE_RE.test(lastText)) return false;
+  return true;
+}
+
+// The LAST substantive message is "replacement/return/spare sheet filled row
+// no X" — the sheet is done, so the warehouse team dispatches automatically.
+// There is nothing to nudge until a LATER message raises a new blocker
+// (not delivered / install visit pending / etc.). If this is the tail, PARK it:
+// stop nudging. Looks at the last 2 messages (a bot/system row may trail).
+// Matches both the strict "sheet filled row no X" AND looser real-world phrasings
+// the team uses — "filled the spare form for RF module", "spare form has been
+// filled", "form filled for spindle" — since a filled form/sheet means the
+// fulfillment step is handed to the warehouse regardless of a row number. ALSO
+// matches "spare order created/placed/raised" (with or without an order ID) —
+// creating the spare/replacement order is the same completion: the warehouse
+// dispatches from there, so stop nudging "please send from warehouse".
+const SHEET_FILLED_RE = /\b((replacement|return|spare)\s+(sheet|form)\s+(filled|has been filled|been filled|is filled)|(filled|filling)\s+(the\s+)?(replacement|return|spare)\s+(sheet|form)|(sheet|form)\s+filled\s+(for|row)|(spare|replacement|return)\s+order\s+(created|placed|raised|has been created|done)|order\s+(created|placed|raised)\s+for\s+(the\s+)?(spare|replacement|rf module|mortise|part))\b/i;
+function isSheetFilledTail(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false;
+  // The filled-form report may not be the very last row (a "@POC" + video, or a
+  // bot nudge, can trail it) — scan the last few and park unless a later message
+  // needs attention (question / request / new issue).
+  const recent = messages.slice(-5);
+  const filled = recent.some((m) => SHEET_FILLED_RE.test((m && m.text) || ""));
+  if (!filled) return false;
+  // Find the last substantive message; if IT needs attention, don't park.
+  let lastText = "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const t = (messages[i] && messages[i].text || "").trim();
+    if (t) { lastText = t; break; }
+  }
+  if (NEEDS_ATTENTION_RE.test(lastText)) return false;
+  return true;
+}
+
+// HANDLED — AWAITING OUTCOME (park). Once a thread reaches a fulfillment-in-motion
+// state — a courier TRACKING ID / dispatch confirmed, OR a future install/spare
+// VISIT aligned/created — the case is IN PROGRESS, not stuck: logistics/PX carry
+// it automatically. We must STOP nudging until a LATER message actually needs
+// attention. We PARK unless the final substantive message is itself a question,
+// a help-seeking / action request, or a fresh issue — in which case the thread
+// has re-opened and we let it flow to normal analysis. (Per instruction: "always
+// stop nudging when the thread seems handled with no recent question / help /
+// action / issue message.")
+const IN_MOTION_RE = /\b(tracking id|tracking no|tracking number|awb|dispatched (on|today|tomorrow|yesterday)?|has been dispatched|been dispatched|out for delivery|shipped|courier|picked by porter|picked up by porter|this has been picked|pickup done|pickup confirmed|picked by|reverse pickup done|visit aligned|visit created|revisit created|created revisit|revisit aligned|created (the )?revisit|installation aligned|px aligned|visit (scheduled|booked) (on|for))\b/i;
+// Signals the LAST message still needs us — a question, a request, or a new
+// problem. If ANY of these are in the final substantive message, do NOT park.
+const NEEDS_ATTENTION_RE = /\?|\b(please|pls|plz|kindly|any update|need help|help here|not working|still (not|facing|getting|an issue)|issue persists|again facing|reopen|not delivered|not received|not installed|failed|pending from|escalat|urgent|cx (is )?(angry|upset|waiting)|cnr|reschedul)\b/i;
+function isHandledAwaitingOutcome(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false;
+  // Find the last NON-empty, non-bot message (skip our own nudge rows / blanks).
+  let last = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const t = (messages[i] && messages[i].text || "").trim();
+    if (t) { last = messages[i]; break; }
+  }
+  if (!last) return false;
+  const lastText = last.text || "";
+  // If the final message needs attention (question / request / new issue), the
+  // thread is live — do not park.
+  if (NEEDS_ATTENTION_RE.test(lastText)) return false;
+  // Park only if the recent tail shows a fulfillment-in-motion state.
+  const tail = messages.slice(-4).map((m) => (m && m.text) || "").join(" \n ");
+  return IN_MOTION_RE.test(tail);
+}
+
+// ROUTINE POST-APPROVAL STEP (park). Once a REPLACEMENT is APPROVED — or the
+// only remaining ask is "share TAT with cx" — the thread is effectively handled:
+// Manuranjan/the agent share the TAT and fill the sheet as routine follow-through
+// (they do it whether or not anyone nudges). Per instruction: never nudge to
+// "share TAT with cx" once replacement is approved / sheet filled, and never
+// nudge a thread that ENDS on that step. We PARK it. This deliberately overrides
+// the generic "please" attention-guard, because "please share TAT" IS the
+// routine step we want silenced — not a real help request. It re-opens only if a
+// LATER message raises a genuinely new problem (handled by NEW_ISSUE_RE below).
+const REPLACEMENT_APPROVED_RE = /\b(replacement approved|approved.*replacement|replacement.*approved|please share (the )?tat|share (the )?tat with (the )?cx|share (the )?tat for the replacement|tat shared|shared (the )?tat|info shared with (the )?(cx|close|customer)|proc(c)?eed with replacement|procced with replacement)\b/i;
+// A genuinely NEW problem raised AFTER the approval — these re-open the thread.
+const NEW_ISSUE_RE = /\?|\b(not delivered|not received|still (not|facing|pending)|issue persists|again facing|reopen|wrong (lock|part|model)|not installed|delivered but|damaged|different (issue|problem)|escalat|urgent|cx (is )?(angry|upset|waiting|following up)|reschedul|cnr)\b/i;
+function isReplacementApprovedTail(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false;
+  // Scan the last few messages for the approval / share-TAT / TAT-shared step —
+  // NOT just the final message. A short trailing note (e.g. "info shared with
+  // the close", a bot row) often follows the approval and would otherwise push
+  // it out of a single-message check.
+  const recent = messages.slice(-4);
+  const approved = recent.some((m) => REPLACEMENT_APPROVED_RE.test((m && m.text) || ""));
+  if (!approved) return false;
+  // Find the last substantive message; if IT raises a genuinely new issue, do
+  // NOT park (the thread has re-opened past the approval).
+  let lastText = "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const t = (messages[i] && messages[i].text || "").trim();
+    if (t) { lastText = t; break; }
+  }
+  if (NEW_ISSUE_RE.test(lastText.replace(REPLACEMENT_APPROVED_RE, ""))) return false;
+  return true;
+}
+
+// LATEST-ESCALATION SLICE. A single thread can hold MORE THAN ONE escalation
+// over time — an old issue and then a fresh "Raise a Product Issue" / "POD
+// escalation time" block for a DIFFERENT problem. Everything above the latest
+// block belongs to the OLD issue and must NOT leak into the current analysis
+// (e.g. an old "family locked out" line firing a false lockout on a new
+// battery-leak escalation). We find the newest escalation-header message and
+// return the messages from there on. If no second block exists, returns all.
+// Signals of a fresh escalation block (any one, case-insensitive):
+//   "POD escalation time", "POC escalation time", "Raise a Product Issue",
+//   a fresh "Issue Bucket" + "Issue Description" header pair,
+//   "Root Request ID" / "Customer Request ID" with a new "Issue Description".
+const ESCALATION_HEADER_RE = /\b(pod escalation time|poc escalation time|raise a product issue|issue bucket)\b/i;
+function latestEscalationMessages(messages) {
+  if (!Array.isArray(messages) || messages.length <= 1) return messages || [];
+  let blockStart = 0;
+  // Scan from the SECOND message onward: a header in messages[0] is just the
+  // original root. A header appearing LATER marks a new escalation block.
+  for (let i = 1; i < messages.length; i++) {
+    const t = (messages[i] && messages[i].text) || "";
+    if (ESCALATION_HEADER_RE.test(t)) blockStart = i;
+  }
+  if (blockStart === 0) return messages;
+  // Keep from the latest block onward. (We intentionally DROP the old root so
+  // stale critical keywords / old issue text can't leak into the new analysis.)
+  return messages.slice(blockStart);
+}
+
+// Build the compact transcript we hand to the LLM.
+function renderTranscript(messages, nameOf) {
+  // Send the FULL thread by default so no message (e.g. a mid-thread "resolved"
+  // or the actual fix) is ever hidden. Only trim if a thread is extremely long,
+  // and when we do, keep the root + the most recent messages and flag the gap.
+  const KEEP_RECENT = Number(process.env.KEEP_RECENT_MSGS || 120);
+  let msgs = messages;
+  let omittedNote = "";
+  if (messages.length > KEEP_RECENT + 1) {
+    const root = messages[0];
+    const recent = messages.slice(-KEEP_RECENT);
+    const omitted = messages.length - 1 - KEEP_RECENT;
+    msgs = [root, ...recent];
+    omittedNote = `\n… [${omitted} earlier reply(ies) omitted — very long thread] …`;
+  }
+  const line = (m) => {
+    const who = nameOf(m.user) || m.bot_id || "unknown";
+    const when = new Date(Number(m.ts) * 1000).toISOString().slice(0, 16).replace("T", " ");
+    const text = (m.text || "").replace(/\s+/g, " ").trim().slice(0, 800);
+    const files = (m.files || []).length ? ` [${m.files.length} attachment(s)]` : "";
+    return `[${when}] ${who}: ${text}${files}`;
+  };
+  if (!omittedNote) return msgs.map(line).join("\n");
+  return [line(msgs[0]) + omittedNote, ...msgs.slice(1).map(line)].join("\n");
+}
+
+const SYSTEM_PROMPT = `You are an operations analyst for Urban Company's Native Smart Locks escalation channel.
+You read a single Slack escalation thread (a customer issue) and decide its status STRICTLY from the thread text.
+
+MULTIPLE ESCALATIONS IN ONE THREAD: sometimes a thread contains MORE THAN ONE escalation over time — an older issue (e.g. a Sept "handle/latch" case that was resolved) and then a NEW, DIFFERENT escalation posted later in the same thread (e.g. an Aug "lock freeze alerts" block with its own "Escalation Type / Issue Bucket / POC escalation time"). When this happens, focus ENTIRELY on the MOST RECENT escalation block and the messages after it. Do NOT merge the two — do not carry the old issue's steps (old mortise spare, old revisit) into the current one, and do not mix their statuses. issue_reported, steps_taken, current_status, blocker and next_actor must all describe the LATEST escalation only. A later escalation block with a fresh POC-escalation-time supersedes everything above it.
+
+An escalation is CLOSED only if the thread clearly shows one of:
+- customer confirmed the issue is resolved / working now / "case closed"
+- an agent/SME/PX states the issue was fixed/resolved (e.g. "issue has now been resolved", "fixed by ...", "working fine now") — even if that message is in the MIDDLE of the thread, not the last one
+- revisit was DONE and issue resolved (not just "revisit created/aligned")
+- replacement was DELIVERED to customer and confirmed (not just "sheet filled" or "approved")
+- spare part DELIVERED/installed and issue fixed
+- a firm denial was given AND accepted, with no open customer demand
+- someone confirms resolution in response to a "is this resolved?" style check — e.g. "yes", "yes resolved", "confirmed, working now", "cx confirmed it's fine"
+- an SME/agent signals closure — "please take closure" (often typo'd "take closer"), "cx arranged their own carpenter and changed/fixed the part", "we can close this". These mean the fix is done; treat as CLOSED.
+- the escalation was WITHDRAWN / retracted / marked ignore or duplicate — e.g. someone (especially the raiser) says "please ignore", "ignore this", "pls close", "duplicate ticket", "raised by mistake", "not needed". Treat these as CLOSED and stop nudging.
+READ EVERY MESSAGE for a resolution statement — a "resolved"/"fixed" note anywhere in the thread means CLOSED unless a LATER message reopens it.
+
+Otherwise it is OPEN. If OPEN, identify the single most accurate blocker state from this list:
+${Object.entries(BLOCKERS).map(([k, v]) => `- ${k}: ${v.label}`).join("\n")}
+
+ROUTING RULES — pick the blocker that matches the CURRENT stuck state:
+- Fresh escalation, no substantive POC reply / next step => awaiting_diagnosis.
+- NEVER RE-ASK A STEP THE THREAD ALREADY REPORTS AS DONE. Before choosing next_action, check whether the pending step was ALREADY completed in a later message — if so, do NOT nudge for it again; move to the step AFTER it (or, if the completion hands back to a POC for review, route to that POC). This is the single most common error. Concrete cases:
+  · A field person/agent gave the UPDATE/findings that were asked for (e.g. "@X check this on revisit" → later "there is a wifi issue, informed cx… [files attached]"). The revisit check is DONE and findings delivered → the ball is now with the SKU POC (Harshavardhan) to decide the next step; do NOT re-nudge the field person to "check on revisit". next_actor = the SKU POC, next_action = decide/confirm the next step given the findings.
+  · "Revisit created" / "I have created revisit on VSAT dashboard" → the revisit IS created. Do NOT nudge "please create/align the revisit" again. The step is now revisit_eta_pending (confirm scheduling / outcome), owned by whoever coordinates the visit.
+  · "Picked by porter" / "this has been picked" / "pickup done" → the reverse pickup is DONE. Do NOT nudge "please pick this up". Nothing to chase unless a later message raises a new problem.
+  · Requested images/photos/invoice/proofs were shared (a later message posts files or says "shared") → do NOT re-ask for them.
+  Judge by the LATEST state. If the last substantive human message REPORTS a completion (not a request), route to whoever must now REVIEW/act on it, not the person who just did it.
+- IGNORE PROCESS / META CHATTER when deciding the pending step: messages like "please raise this from the portal", "use the portal", "please guide the agent", "raise on dashboard", spelling corrections, or wrong-installation-date scoldings are NOT the escalation's next step. They are housekeeping. The real pending step is the DIAGNOSIS / resolution of the CUSTOMER'S actual issue. Do NOT set next_actor to "guide someone on the portal" or similar — if the actual product issue still has no diagnosis, it's awaiting_diagnosis on the SKU POC, and next_actor should be [] (let the blocker route to the SKU POCs).
+- Issue needs validation / root-cause by the SKU POC (is it real? revisit or replacement?) => rca_not_closed.
+- DO NOT PRESCRIBE AN UNVALIDATED RESOLUTION. Only classify as a revisit/replacement/spare blocker if a POC in the thread has ACTUALLY decided that action is needed (e.g. "please create revisit", "please replace the lock", "fill spare sheet"). A CUSTOMER asking for a PX visit/replacement, an agent relaying "cx wants a visit", or your own inference is NOT validation — never invent a revisit/replacement/spare that no POC committed to. If the thread is still waiting on the SKU POC's verdict/update (people are asking "@POC any update?", "please check", "please help here" and the POC hasn't decided the next step), the blocker is rca_not_closed (or awaiting_diagnosis) and the ask is for the POC's UPDATE/verdict — NOT "align a revisit" or "replace the lock". Judge only by what POCs have confirmed, not what the customer requested.
+- ONLY when primary POCs explicitly could not close it and it needs deep firmware/software/electronics/LOGS investigation by Engineering (PCB, firmware bug, signal logic, offline-logs analysis, MPCB/mother-PCB version or hardware-revision check) => deep_firmware_rca, tagged to Abhiram (alfadelta10010). Signals: someone explicitly asks "@alfadelta10010 / @Abhiram please check the logs / look into it / need your help to check", "check the mpcb version", or the case has clearly moved past routine steps into a logs/firmware/mpcb investigation. NOTE: when an Engineering step is the pending one (e.g. "@alfadelta can you check the mpcb version"), that is Abhiram's job — do NOT tag the agent (Sneha etc.) to do an Engineering task; set blocker=deep_firmware_rca so it routes to Abhiram. Do NOT use this for hardware/mechanical or discovery like "check debugger if it's RF module or lock bell" — that stays rca_not_closed with the SKU POC.
+- ENTITY RESET vs LOGS RCA — do not confuse Gagan and Abhiram. Gagan does entity/config resets (mPIN, "entity stuck at registration"). If Gagan ALREADY did the reset and the case has since evolved into a WiFi-offline / logs / firmware investigation now handed to Abhiram, the CURRENT blocker is deep_firmware_rca (Abhiram) — NOT entity_reset (Gagan). Use the CURRENT tail state: whoever Engineering-side was LAST asked to investigate is the actor. Do not resurface Gagan's already-completed reset.
+- Customer's config / setup / master-PIN / mPIN stuck needing an entity reset (and NOT yet done) => entity_reset. The reset owner is whichever engineer was TAGGED for it — Gagan OR Abhiram (alfadelta10010). If Manuranjan/a POC pinged "@alfadelta10010 please reset the entity", the owner is Abhiram; if they pinged Gagan, it's Gagan. Route to whoever was actually asked.
+- "ENTITY HAS BEEN RESET" MEANS THE RESET IS DONE — the blocker is NO LONGER entity_reset, and it does NOT move to Gagan. Whoever performed it (often Abhiram, sometimes Gagan) has completed the Engineering step. Once you see "entity has been reset" / "entity reset done" / "reset done", the CURRENT step is the OPERATIONAL follow-through (insert battery, reset the lock, retry configuration) owned by whoever was asked in the tail (usually an agent like Vikash/Rushali, e.g. "@Vikash @Rushali please reset the lock and configure"). Set blocker to that operational step (rca_not_closed or a plain handoff), next_actor = the addressed agent(s), and NEVER set blocker=entity_reset or tag Gagan after the reset is complete. Do NOT tag Gagan for a reset that Abhiram already did — Gagan may not even be in the thread.
+- "Replacement sheet filled row no X" but the parcel is still in transit / awaiting courier dispatch / tracking => replacement_delivery_pending.
+- Replacement needed but not yet initiated / no sheet => replacement_not_assigned.
+- "SHEET FILLED ROW NO X" MEANS THAT STEP IS DONE — never ask to fill it again. A message like "Replacement sheet filled row no 1573" or "spare sheet filled row 1317" is a COMPLETION report (the sheet IS filled). Do NOT set blocker=replacement_not_assigned / "sheet not filled" or ask anyone to "fill the sheet" after you see a row number. The next step is whatever comes AFTER filling (share invoice, dispatch, delivery, install) — route to that, tagging whoever was looped in on the completion line.
+- "SPARE ORDER CREATED / PLACED / RAISED" IS ALSO A COMPLETION. A message like "spare order created UCEPC-..._S1", "spare order placed", or "order raised for the RF module" means the spare/replacement order is DONE and the warehouse now dispatches it. Do NOT then ask anyone to "send manually from warehouse" or "create the spare" — that step is complete. There is nothing to nudge until dispatch/tracking or a new blocker appears. (The system parks these automatically; this is a backstop.)
+- "REPLACEMENT APPROVED" / "SHARE TAT WITH CX" IS A ROUTINE, NON-NUDGE STEP. Once a message says the replacement is APPROVED (e.g. "Replacement approved please share TAT with cx"), the sheet-filling + TAT-sharing follow-through happens automatically (Manuranjan asks the agent; the agent shares the TAT regardless). NEVER set blocker="replacement not initiated / sheet not filled" after an approval, and NEVER produce a nudge whose action is "share the TAT with the customer". If the thread's latest state is "replacement approved / share TAT", there is nothing to nudge — do not invent a blocker. (The system parks these automatically; this is a backstop.)
+- ROHIT / DELIVERY IS NARROW: only route to delivery_delay or replacement_delivery_pending (Rohit Singh Bisht) when the thread EXPLICITLY shows a physical parcel ALREADY DISPATCHED and in transit with a courier tracking ID, and delivery is the stuck step. The following are NOT delivery cases and must NOT go to Rohit: "replacement approved", "sheet filled row X", "please share TAT/invoice/details", "share TAT with cx", pending on-site installation, or any step where an AGENT was asked to share/confirm something. Those are pre-dispatch handoffs — route by the actual pending step (usually the agent handoff, or replacement_not_assigned / revisit_not_aligned). If in doubt, do NOT pick Rohit.
+- Spare part (mortise, RF module, spring, strike plate, battery box) requested but not confirmed dispatched => spare_not_sent.
+- INSTALLATION vs DELIVERY — do NOT confuse them. If the replacement lock has ARRIVED/been approved and the stuck step is INSTALLING it at the customer (phrases like "lock not installed yet", "new lock installation pending", "install visit pending", "schedule installation", "align PX for installation") => this is a REVISIT alignment problem: revisit_not_aligned (no PX aligned) or revisit_eta_pending (visit booked but not done). It is NOT replacement_delivery_pending and NOT a delivery/logistics (Rohit) case. delivery_delay / replacement_delivery_pending / Rohit are ONLY for a physical parcel in transit with courier tracking, never for a pending on-site installation.
+- Revisit NEEDED but no PX aligned => revisit_not_aligned. Revisit created/aligned but not done => revisit_eta_pending.
+- "VISIT CREATED" / "REVISIT CREATED" / "VISIT CREATED FOR FLASHING" MEANS THE REVISIT IS NOW ALIGNED — the diagnosis phase is OVER. Once ANY message says a visit/revisit was CREATED or ALIGNED (e.g. "visit created for flashing", "revisit created by <name>", "px assigned, visit scheduled"), the blocker is revisit_eta_pending (NOT awaiting_diagnosis, NOT rca_not_closed, NOT "check debugger"). Do NOT re-ask anyone to "check the debugger" or "diagnose" after a visit has been created — that step is done. The pending step is now: confirm the created visit is scheduled and validate it resolves the customer's issue. This is owned by the SKU POC (Harshavardhan V — the primary RCA POC for all SKUs), NOT the agent who created the visit and NOT re-diagnosing. next_action_needed = "confirm the flashing/revisit visit is scheduled and validate it resolves <the issue>". steps_taken MUST reflect this progress (diagnosis directive given → visit created) — it is NOT "no substantive action taken yet".
+- A PX-led error, poor installation, property damage, OR a revisit audit / work-quality check => revisit_audit_quality.
+- REFIT / FIELD-FIX ALREADY FAILED => SKU RCA, not an SME blast. If a PX already visited and re-fitted/replaced the part (mortise re-fitment, part swap) BUT the issue STILL persists ("issue occurs even after PX visit and mortise re-fitment", "even after refit still failing"), the field fix has been exhausted — this is now a root-cause question for the SKU POC. Set blocker=rca_not_closed (routes to the SKU RCA owner: Harshavardhan V for all SKUs), NOT revisit_audit_quality (do not blast all SMEs when the on-site fix already failed).
+- POST-REPLACEMENT / PROMS RCA IS ENGINEERING, NOT SME AUDIT: if the defective lock has been REPLACED and the OLD unit is being taken to Proms / examined for root-cause ("get this lock to proms for RCA", "reached proms", "let's RCA", "@Abhiram this is the case you have the lock and logs"), that is a deep hardware/firmware RCA owned by Engineering => deep_firmware_rca (Abhiram). Do NOT route this to the SME pool (revisit_audit_quality) — the SMEs audit field/PX work, not a returned-unit lab RCA.
+- Defective unit reverse pickup pending => reverse_pickup_pending. (If BOTH install and old-unit pickup are pending, pick the step blocking progress first — usually the installation.)
+- Delivery delayed / SLA breach / no tracking (a parcel in transit) => delivery_delay.
+- Judge the LATEST state: a later message overrides earlier ones.
+
+Also extract:
+- "sku": the lock SKU if visible in the thread (e.g. "Native Lock Ultra", "Native Lock Pro", "Native Lock S"); else null. This decides RCA routing.
+- "pickup_dest": the FINAL destination of the defective unit's reverse pickup. DEFAULT is "warehouse" (handled by Sharvan Negi). It is "proms" whenever the lock is ultimately going to the Proms office for physical RCA. Decide by these signals, in order: (1) if ANY message says the lock should go to Proms / "get this to proms" / "align it from Wh to Proms" / Padmanabhan is told to get/align it to Proms => "proms"; (2) else if the pickup is assigned only to Sharvan Negi (warehouse) with no Proms mention => "warehouse"; (3) if it literally says "proms" => "proms"; (4) otherwise => "warehouse". TWO-HOP RULE: the FINAL destination wins. If Sharvan is asked to pick from the customer BUT a message also says it's going "Wh to Proms" or "get this to Proms", the destination is "proms" (Padmanabhan owns the Proms leg) — Sharvan doing the first-leg warehouse pickup does NOT make it a warehouse case. A bare "@Sharvan we'll pick this lock" with no Proms mention stays "warehouse". Only relevant for reverse_pickup_pending.
+- "active_sme": if a specific SME / trainer clearly worked this case (diagnosed, visited, or fixed it) — e.g. "Manohar fixed it", "Chandan visited", "Janmayjay handling PX" — return their first name only (e.g. "Manohar"). Only meaningful for revisit-audit / PX-quality cases where ONE named person is the actor. If no single SME is clearly the actor, null.
+- "near_closure": true ONLY if the fix has ACTUALLY BEEN DONE and just needs a customer confirmation — the replacement/spare was INSTALLED, the revisit was COMPLETED ("visit done"), the fix was applied and works. A visit that is merely ALIGNED / SCHEDULED / "px will visit today" is NOT near_closure — the work hasn't happened yet, so it's still an open revisit (revisit_eta_pending). A pending 2nd replacement or an install visit not yet done is NOT near_closure. It is still OPEN (not yet confirmed), and the natural next question is "is this now resolved?". Otherwise false. Do NOT set this while real work is still pending (parts not delivered, revisit scheduled-but-not-done, RCA open). CRITICAL EXCEPTIONS — near_closure MUST be false if EITHER: (a) a NEW / different problem is raised in the LAST message(s) after the original fix (e.g. mortise replaced and "visit done", then "lock keeps going offline"); OR (b) AFTER a "visit done", later messages show work is STILL INCOMPLETE — "cx out of city / will reschedule", "uninstallation pending", "pickup pending", "still not installed", "cx cnr". A "visit done" that is later contradicted by pending install/pickup/reschedule is NOT closure — route to that pending step (revisit/pickup) instead.
+
+WHO OWES THE NEXT ACTION — this decides who we TAG. Do these STEPS IN ORDER:
+
+STEP 1 — FIND THE HANDOFF FIRST (before anything else). Look at the last ~4 messages of the thread. Is there an explicit "@Person please/kindly/pls <do something>" request — e.g. "@Padmanabhan align front panel from proms", "@Sindhu create revisit on dashboard", "@Rushali please check Iotfy / try these steps", "@Sneha share invoice"? If YES: the ADDRESSED person is next_actor, handoff=true. This OVERRIDES the escalation's default owners. Set next_actor to that addressed person and stop looking for other candidates.
+
+STEP 2 — THE "Primary PoC" HEADER IS NOT THE NEXT ACTOR. The escalation root lists "Primary PoC" (usually Manuranjan + the SKU POC). Those are DEFAULT OWNERS for cc, NOT automatically next_actor. Do NOT tag them as the actor just because they're in the header — if a Step-1 handoff exists, the handoff person wins. Only fall back to the owners when there is genuinely no in-thread handoff and no specific person owes the next step.
+
+STEP 3 — remaining rules below refine this. Read the LAST substantive request carefully:
+- GROUNDING RULE: every name you put in next_actor or asked_by MUST be a person who literally appears as a message author or an @mention in the transcript above. NEVER invent or guess a name. If you are not certain a specific named person owes the next step, set handoff=false and next_actor=[] — do not fabricate.
+- USE THE CURRENT (TAIL) STATE, NOT A STALE MID-THREAD STEP: long threads move through stages (e.g. "share invoice" → "approved, same model only" → "cx aligned, wants PX to install"). Anchor blocker, next_actor and current_status on the LATEST stage near the END of the thread. Do NOT resurface an earlier step that has already been superseded (e.g. do not say "waiting on invoice" if later messages show the replacement was approved and the conversation has moved to install/PX/next-order). Read the last several messages to find where it TRULY stands now.
+- LAST POSTER ≠ NEXT ACTOR: next_actor is whoever was ASKED to do the pending step, not simply whoever posted most recently. Scan the LATEST real "@X please do Y" request and use X — that request is OFTEN the last message (use it then), but sometimes the last message is unrelated (a supervisor's process question, a customer-status relay, "any update?" chatter); in that case skip it and use the most recent genuine request. Judge by CONTENT, not position.
+- NEVER pick Subhang / Subhang Reddy as next_actor. He is the supervisor who is cc'd on every escalation and never performs the field action (confirming with customers, filling sheets, delivering parts). If the pending step was addressed to an escalation agent (e.g. "@muskan please confirm with cx"), that AGENT is next_actor.
+- ENGINEERING — CONSULT vs BLOCKER. Abhiram (alfadelta10010) and Gagan are Engineering. TWO different situations:
+  (a) CONSULT (ignore): a POC pings them in passing ("@Abhiram check this", "@Gagan ++") while other work continues — do NOT make them next_actor; the customer-facing step still sits with the SKU POC / agent.
+  (b) BLOCKER (route to them): the case is genuinely STUCK on Engineering — primary POCs explicitly handed it over and everyone is now waiting on Engineering's verdict (e.g. repeated "@alfadelta10010 need your help to check the logs", "please look into it, how do we resolve") with no one else owing a step. THEN set blocker=deep_firmware_rca (Abhiram) or entity_reset (Gagan, only if the reset itself is still pending) — the blocker's own POC handles tagging, so leave next_actor=[] / handoff=false and let the blocker route it. Use the CURRENT engineer: if the case moved from Gagan's (completed) reset to an Abhiram logs investigation, it's deep_firmware_rca (Abhiram), not entity_reset (Gagan).
+  (c) RCA ALREADY DELIVERED (moved on): if Engineering has ALREADY posted their RCA findings/verdict and the thread has moved to an OPERATIONAL next step (e.g. "@Padmanabhan align the faulty battery", "@Rushali connect with cx to run the battery-isolation test", "replace the lock"), the blocker is NO LONGER deep_firmware_rca — it is that new step (spare_not_sent / reverse_pickup_pending / rca_not_closed / a handoff to the named person). Do NOT keep asking Engineering to "investigate" after they've given findings and handed it onward. next_actor = whoever was asked to do the operational step.
+- The rule: whoever must ACT NEXT to move the issue forward is "person B" — we TAG them. Everyone they unblock (the person who asked = "person A", plus the SKU POC) gets cc'd, not tagged.
+- CRITICAL DIRECTION RULE: in a message like "@X please share the invoice" or "@X please replace the lock", the person MENTIONED/ADDRESSED (X) is person B (next_actor) — they must act. The AUTHOR of that message is person A (asked_by) — they are WAITING. NEVER swap these. The author who wrote "please share invoice" is NOT the one who owes the invoice; the person they addressed owes it. Example: "Manuranjan: @Rushali please share invoice" ⇒ next_actor=["Rushali"], asked_by="Manuranjan".
+- COMPOUND "I DID X, @Y PLEASE DO Z" LINES: a message can report a completed action AND hand off the next one in the same breath — e.g. "Manuranjan: Replacement sheet filled row no 1566, @Sneha please share" or "@Sneha Replacement sheet filled ... please share". The author (Manuranjan) already did their part (filled the sheet); the PENDING step is what they asked the ADDRESSEE to do (Sneha to share the invoice). next_actor is the ADDRESSEE (Sneha), NOT the author — even though the author's name leads the sentence and they did the prior step. Example: "Manuranjan: @Sneha replacement sheet filled row 1566 please share" ⇒ next_actor=["Sneha"], asked_by="Manuranjan".
+- MULTIPLE ADDRESSEES: if the request addresses SEVERAL people ("@Yuvraj @Rushali please share invoice"), ALL of them owe the action — return ALL their names in next_actor (e.g. ["Yuvraj Gupta","Rushali Chaurasia"]). Do not pick just one.
+- COMPLETION-REPORT HANDOFF ("@X <I did the thing>"): a message that reports a step is DONE and addresses it back to a POC — e.g. "@Jyothi visit created for flashing", "@Harsha revisit done", "@Jyothi sheet filled row 12" — hands the ball BACK to the addressed POC (X) to verify/validate the next step, EVEN THOUGH it is not phrased as "please do Y". Set handoff=true, next_actor=[X], asked_by=the author. The pending step is X validating/confirming that completed action resolves the issue (e.g. "confirm the created visit is scheduled and validate it fixes the notifications"). Do NOT fall back to the escalation's default diagnosis owners after such a line — the named POC owns the confirmation.
+- "handoff": true if the latest substantive request addresses ANOTHER person (or people) to do/provide/drive something and we are now waiting on them — e.g. "@Sneha please share TAT with cx", "@X please share invoice", "@X please connect with cx", "@X please fill spare sheet", "@X please confirm ...", "@Sindhu please help here / align the px / check on this", "@X please look into this". A request phrased as "help"/"look into"/"align"/"check" still counts — the addressee owes the next step. A COMPLETION-REPORT addressed to a POC ("@X visit created / done / sheet filled") ALSO counts (handoff=true, next_actor=X, per the rule above). Otherwise false.
+- PX / VISIT COORDINATION: when the pending step is aligning or completing a PX / VSAT visit, and a specific person is coordinating that visit in the thread (e.g. Sindhu, or whoever keeps posting the visit-scheduling updates and was last asked "please align px for <date>"), THAT coordinator is next_actor — not the SKU POCs. The SKU POC (Harshavardhan V) gets cc'd, but the person who owns the visit scheduling is who we tag to confirm/align the visit. Do NOT default to asking the SKU POC to "confirm visit completion" when a named coordinator owes the alignment.
+- "next_actor": an ARRAY of DISPLAY NAMES of person(s) B (the ADDRESSEE(S) who must act next), each copied EXACTLY as it appears in the transcript (e.g. ["Rushali Chaurasia","Yuvraj Gupta"]). Must be the person(s) ADDRESSED in the request, not its author. Use a generic role word (["PX"] or ["logistics"]) only if truly no named person is addressed. If nobody specific, null or [].
+- "next_action_needed": <=120 char — the concrete pending step person(s) B must do, REFRAMED IN YOUR OWN WORDS as a crisp, closure-oriented instruction. This is the MOST IMPORTANT field for the nudge quality — you are an intelligent agent, NOT a copy-paste bot. NEVER echo the thread's last line verbatim. Rewrite it into the clearest, most actionable version, naming the exact deliverable + the missing detail/ETA needed to close. Examples of the reframe you MUST do:
+  · last line "@yash confirm tried with unpairing and pairing" → "confirm whether unpair-repair of the RF module was tried, and if the issue persists, whether a revisit/replacement is needed"
+  · last line "@Manohar fill the spare sheet mortise ... align asap or lock may get stuck" → "fill the mortise spare sheet and expedite dispatch — flagged risk of the lock getting stuck"
+  · last line "@Rushali create revisit on the dashboard" → "create the revisit on the dashboard and share the confirmed visit date/time with the customer"
+  · last line "@Sindhu confirm px visit" → "confirm the PX visit is completed and share the outcome / revised ETA"
+Make it specific, add the ETA/closure ask, and improve on the raw request. Null only if genuinely unclear.
+- "asked_by": the DISPLAY NAME of person A (the AUTHOR who asked person B to act), exactly as in the transcript, or null. This person gets cc'd, never tagged as the actor.
+
+Decide who the thread is currently WAITING ON (the person who owes the next action), by name if visible.
+
+WRITE A SPECIFIC, EVIDENCE-BASED SUMMARY grounded in the WHOLE thread (read the root escalation AND every reply):
+- RELATIVE-DATE RULE (applies to EVERY field — current_status, next_action_needed, ask, one_line, etc.): NEVER copy relative-time words ("today", "tomorrow", "yesterday", "this evening", "in 30 min") from thread messages — those were written days ago and mislead about the current time. A message saying "px visit scheduled for today at 4pm" written last Thursday does NOT mean today. Resolve to the actual date if one is visible (e.g. "the Aug 7 visit"), else phrase neutrally ("the scheduled visit", "the pending visit"). When a scheduled visit's date is in the PAST relative to now, ask to CONFIRM THE OUTCOME of that past visit — not to complete a visit "today".
+- "issue_reported": <=140 char — what the CUSTOMER originally reported (from the escalation/root message). The core problem. Do NOT copy relative-time words like "today"/"yesterday" verbatim from old messages (they mislead the reader about when it happened); rephrase neutrally (e.g. "back panel loose since installation") or use the actual date if visible.
+- "steps_taken": <=300 char — a CHRONOLOGICAL synthesis of everything done/attempted across the thread, in order, reading EVERY reply. Include concrete actions and outcomes (e.g. "Diagnosed on call → auto-lock failing; PX revisit 30 Jul re-seated mortise but issue persisted; replacement approved, sheet row 1531 filled; spare dispatched, tracking 18127599232"). Name the actions and who did them where visible. Do NOT just restate the issue or paraphrase only the last message; cover the whole arc. If genuinely nothing was done, say "No substantive action taken yet."
+- "current_status": <=140 char — where it stands RIGHT NOW and exactly what is missing/pending.
+- "one_line": <=160 char — a single-line condensation of current_status (used in the digest).
+- "ask": one situation-specific question for the blocked POC — the precise missing next step / ETA. Phrase it as a direct question WITHOUT addressing anyone by name (do NOT start with "Manuranjan," or "Jyothi," etc.); the system prepends the correct @mentions. Do NOT include raw Slack user IDs or <@...> mentions in any field.
+- "last_activity": <=100 char paraphrase of the most recent substantive message + who sent it (digest only).
+
+Return ONLY compact JSON:
+{"status":"open|closed","blocker":"<key or null>","sku":"<sku or null>","pickup_dest":"proms|warehouse|null","active_sme":"<sme first name or null>","near_closure":true|false,"handoff":true|false,"next_actor":["<display name(s) who must act>"],"asked_by":"<display name of person who asked, or null>","next_action_needed":"<...>","waiting_on":"<name or role or null>","issue_reported":"<...>","steps_taken":"<...>","current_status":"<...>","one_line":"<...>","ask":"<...>","last_activity":"<...>"}`;
+
+// Salvage routing fields from a (possibly TRUNCATED) JSON string when full
+// JSON.parse fails. The schema orders routing fields first, so these usually
+// survive truncation. Returns a partial analysis object, or null if not even
+// `status` is recoverable.
+function salvageFields(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const str = (key) => {
+    const m = raw.match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"', "i"));
+    return m ? m[1].replace(/\\"/g, '"').trim() : null;
+  };
+  const bool = (key) => {
+    const m = raw.match(new RegExp('"' + key + '"\\s*:\\s*(true|false)', "i"));
+    return m ? m[1].toLowerCase() === "true" : false;
+  };
+  const arr = (key) => {
+    const m = raw.match(new RegExp('"' + key + '"\\s*:\\s*\\[([^\\]]*)\\]', "i"));
+    if (!m) return [];
+    return m[1].split(",").map((s) => s.replace(/^["'\s]+|["'\s]+$/g, "")).filter(Boolean);
+  };
+  const status = str("status");
+  if (!status) return null;
+  return {
+    status,
+    blocker: str("blocker"),
+    sku: str("sku"),
+    pickup_dest: str("pickup_dest"),
+    active_sme: str("active_sme"),
+    near_closure: bool("near_closure"),
+    handoff: bool("handoff"),
+    next_actor: arr("next_actor"),
+    asked_by: str("asked_by"),
+    next_action_needed: str("next_action_needed"),
+    waiting_on: str("waiting_on"),
+    issue_reported: str("issue_reported"),
+    steps_taken: str("steps_taken"),
+    current_status: str("current_status") || str("one_line"),
+    one_line: str("one_line") || str("current_status"),
+    ask: str("ask"),
+    last_activity: str("last_activity"),
+    _salvaged: true,
+  };
+}
+
+async function analyzeThread({ messages, nameOf, apiKey, model, provider }) {
+  // Strip the bot's OWN nudge posts AND meta chatter about the bot up front. In
+  // auto mode the bot posts nudges INTO the thread; those must not count as
+  // activity. Likewise, humans sometimes talk ABOUT the nudger ("how do I stop
+  // these summary messages?", "is 'resolved' good enough?") — those must not
+  // count as a reopen (they often contain a "?") or as the last substantive
+  // message. Every deterministic detector below runs on real escalation messages.
+  const humanMsgs = Array.isArray(messages) ? messages.filter((m) => !isBotMsg(m) && !isMetaMsg(m)) : messages;
+  messages = humanMsgs && humanMsgs.length ? humanMsgs : messages;
+  // Deterministic short-circuit: a withdrawn/ignore/duplicate escalation is
+  // closed — don't spend an LLM call or nudge it. Critical keywords do NOT
+  // override a withdrawal (a retracted ticket is retracted).
+  if (isWithdrawn(messages)) {
+    return { status: "closed", blocker: null, withdrawn: true };
+  }
+  // Deterministic resolution: a clear "issue resolved / px visited / working now"
+  // at the tail closes it — overrides stale critical keywords earlier up-thread.
+  if (isResolvedTail(messages)) {
+    return { status: "closed", blocker: null, resolved: true };
+  }
+  // Replacement/return/spare sheet filled as the tail → PARKED. Warehouse
+  // dispatches automatically; nothing to nudge until a later blocker appears.
+  if (isSheetFilledTail(messages)) {
+    return { status: "parked", blocker: null, sheet_filled: true };
+  }
+  // Replacement approved / "share TAT with cx" as the tail → PARK. This is a
+  // routine post-approval step the agent does regardless; never nudge it or a
+  // thread ending on it. Re-opens only if a later message raises a new issue.
+  if (isReplacementApprovedTail(messages)) {
+    return { status: "parked", blocker: null, replacement_approved: true };
+  }
+  // Handled / fulfillment-in-motion (tracking shared, dispatched, or install
+  // visit aligned) with no pending question/request/issue in the last message →
+  // PARK. Logistics/PX carry it; stop nudging until a later message needs us.
+  if (isHandledAwaitingOutcome(messages)) {
+    return { status: "parked", blocker: null, in_motion: true };
+  }
+  // Requested images/photos/stickers/proofs were SHARED (a later message carries
+  // file attachments) → the ask is fulfilled. Park until someone responds with a
+  // next step. (Keyed off attachments, not author, since tickets get reassigned.)
+  if (isImageRequestFulfilledTail(messages)) {
+    return { status: "parked", blocker: null, images_shared: true };
+  }
+  const transcript = renderTranscript(messages, nameOf);
+  // Scope the CRITICAL / soft scans to the LATEST escalation block only, so an
+  // OLD issue's keywords (e.g. a prior "family locked out" line) can't fire a
+  // false critical on a NEW, different escalation (e.g. a battery-leak block).
+  // The LLM already gets the multi-escalation rule in the prompt; this fixes the
+  // deterministic pre-scan which otherwise reads the whole thread.
+  const latestMsgs = latestEscalationMessages(messages);
+  const criticalScope = renderTranscript(latestMsgs, nameOf);
+  const critical = scanCritical(criticalScope);
+  const softFlag = scanSoftFlag(criticalScope);
+  // If the thread contains a LATER escalation block, hand the LLM only that
+  // block (plus a one-line note) so it can't mix the old issue in. Otherwise
+  // send the full transcript.
+  const hasLaterBlock = latestMsgs.length && latestMsgs.length < messages.length;
+  const llmTranscript = hasLaterBlock
+    ? `[NOTE: earlier messages in this thread were a PRIOR, resolved/separate escalation and have been removed. Analyze ONLY the current escalation below.]\n${criticalScope}`
+    : transcript;
+
+  // Provider-switchable, both OpenAI-compatible. Default: Mistral.
+  //   mistral -> mistral-medium-latest (free tier: no monthly cap, strong quality)
+  //   groq    -> llama-3.1-8b-instant  (fallback)
+  const prov = (provider || process.env.LLM_PROVIDER || "mistral").toLowerCase();
+  const isMistral = prov === "mistral";
+  const url = isMistral
+    ? "https://api.mistral.ai/v1/chat/completions"
+    : "https://api.groq.com/openai/v1/chat/completions";
+  const modelId = model || (isMistral ? "mistral-medium-2508" : "llama-3.1-8b-instant");
+
+  const body = {
+    model: modelId,
+    temperature: 0,
+    // 1200 gives headroom so the JSON isn't truncated mid-object (the usual parse
+    // failure). Safe now: the per-call abort timeout below bounds runtime no matter
+    // the token cap, so a bigger cap can't reintroduce the hang. Env-configurable.
+    max_tokens: Number(process.env.LLM_MAX_TOKENS || 1200),
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: `CURRENT DATE/TIME (IST): ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "full", timeStyle: "short" })}\nUse this to resolve relative dates ("today"/"tomorrow" in old messages are NOT the current date — a visit "scheduled today" written days ago is now in the past; ask to confirm its outcome).\n\nTHREAD TRANSCRIPT:\n${llmTranscript}\n\nReturn the JSON now.` },
+    ],
+  };
+
+  const provLabel = isMistral ? "Mistral" : "Groq";
+  // Per-call timeout so a STALLED LLM request can't hang the whole function until
+  // Vercel's 300s maxDuration (which kills it before it ever posts nudges → the
+  // "no nudges at all + cron timeout" failure). A stalled call now aborts fast
+  // and surfaces as an error the scanner skips, letting the next thread proceed.
+  const callTimeoutMs = Number(process.env.LLM_TIMEOUT_MS || 12000);
+  let json;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), callTimeoutMs);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      // A TIMEOUT (abort) means the endpoint is stalling — retrying just stalls
+      // again and burns the run budget, so fail fast. Only retry a genuine
+      // (non-abort) network blip, and only once more.
+      if (ac.signal.aborted) throw new Error(`${provLabel} error: timeout after ${callTimeoutMs}ms`);
+      if (attempt === 2) throw new Error(`${provLabel} error: ${(e && e.message) || e}`);
+      continue;
+    }
+    clearTimeout(timer);
+    if (res.status === 429 || res.status === 503) {
+      if (attempt === 2) { json = await res.json(); break; } // give up -> surface error
+      const retryAfter = Number(res.headers.get("retry-after")) || (2 * (attempt + 1));
+      await new Promise((r) => setTimeout(r, Math.min(retryAfter * 1000, 15000)));
+      continue;
+    }
+    json = await res.json();
+    break;
+  }
+  if (!json) throw new Error(`${provLabel} error: no response`);
+  if (json.error) throw new Error(`${provLabel} error: ${json.error.message || JSON.stringify(json.error)}`);
+
+  let parsed;
+  let rawText = "";
+  try {
+    rawText = (json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content || "").trim();
+    let cleaned = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+    const first = cleaned.indexOf("{");
+    const last = cleaned.lastIndexOf("}");
+    if (first !== -1 && last !== -1) cleaned = cleaned.slice(first, last + 1);
+    parsed = JSON.parse(cleaned);
+  } catch {
+    // Full parse failed — usually the JSON was TRUNCATED mid-object. The schema
+    // puts the ROUTING fields first (status, blocker, next_actor,
+    // next_action_needed, handoff, sku) and the long free-text summary fields
+    // last, so truncation almost always leaves the routing intact. SALVAGE those
+    // via regex so the thread still gets a correct nudge instead of being skipped
+    // forever (a consistently-unparseable thread would otherwise never nudge).
+    const salvaged = salvageFields(rawText);
+    if (salvaged && salvaged.status) {
+      parsed = salvaged;
+    } else {
+      // Nothing usable — skip this run (no nudge), retry next run.
+      return { status: "error", parse_error: true, raw: rawText ? rawText.slice(0, 500) : "(empty response)" };
+    }
+  }
+
+  // Strip raw Slack user IDs (e.g. "U0B99EPHE5P") the model sometimes copies
+  // from the transcript into free-text fields — they render as ugly plain text.
+  // The real POC mentions are added separately by the nudge composer.
+  const stripIds = (s) => typeof s === "string"
+    ? s.replace(/<@([A-Z0-9]+)>/g, "").replace(/\bU[A-Z0-9]{6,}\b[ ,:]*/g, "").replace(/\s{2,}/g, " ").trim()
+    : s;
+  for (const f of ["issue_reported", "steps_taken", "current_status", "one_line", "ask", "last_activity", "next_action_needed"]) {
+    parsed[f] = stripIds(parsed[f]);
+  }
+
+  // Critical override: if keywords fired, force-flag even if LLM said closed.
+  if (critical.length) {
+    parsed.critical = critical;
+    if (parsed.status === "closed") parsed.status = "open";
+  }
+  // Soft flag: visible note only, no escalation. Prefer the deterministic scan;
+  // it never fires the banner.
+  if (softFlag) parsed.soft_flag = softFlag;
+
+  // "visit done" at the tail: the revisit happened. Force near-closure and clear
+  // any stale handoff so the nudge asks to CONFIRM resolution, not to re-create
+  // the (already-completed) revisit. Overrides a stale revisit_not_aligned.
+  if (isVisitDoneTail(messages)) {
+    parsed.near_closure = true;
+    parsed.handoff = false;
+    parsed.next_actor = [];
+    parsed.next_action_needed = null;
+  }
+  return parsed;
+}
+
+module.exports = { analyzeThread, scanCritical, scanSoftFlag, renderTranscript };
