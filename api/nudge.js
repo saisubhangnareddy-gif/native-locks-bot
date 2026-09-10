@@ -108,7 +108,7 @@ module.exports = async function handler(req, res) {
   const token = process.env.SLACK_BOT_TOKEN;
   const provider = (process.env.LLM_PROVIDER || "mistral").toLowerCase();
   const apiKey = provider === "mistral" ? process.env.MISTRAL_API_KEY : process.env.GROQ_API_KEY;
-  const model = process.env.LLM_MODEL || (provider === "mistral" ? "mistral-medium-2508" : "llama-3.1-8b-instant");
+  const model = process.env.LLM_MODEL || (provider === "mistral" ? "mistral-medium-2508" : "llama-3.3-70b-versatile");
   const channel = process.env.PRODUCT_CHANNEL_ID; // C07GZK9UKQW
   const mode = process.env.NUDGE_MODE || "draft";
 
@@ -116,7 +116,10 @@ module.exports = async function handler(req, res) {
   // (1784213730.941059) or the permalink digits (1784213730941059).
   const threadParam = (req.query && req.query.thread) || "";
   if (threadParam) {
-    let threadTs = String(threadParam);
+    // Accept any of: dotted thread_ts (1788884413.448549), raw digits
+    // (1788884413448549), or the Slack permalink form with a leading "p"
+    // (p1788884413448549). Strip a leading "p" and re-insert the dot if absent.
+    let threadTs = String(threadParam).trim().replace(/^p/i, "");
     if (!threadTs.includes(".") && threadTs.length > 6) {
       threadTs = threadTs.slice(0, threadTs.length - 6) + "." + threadTs.slice(-6);
     }
