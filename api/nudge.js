@@ -137,14 +137,22 @@ module.exports = async function handler(req, res) {
 
     if (mode === "auto") {
       let posted = 0;
+      let postErrors = 0;
+      let lastPostError = null;
       for (const r of openNudges) {
         try {
           await slackClient.postThreadReply(token, channel, r.threadTs, r.nudgeText);
           await recordNudge(channel, r);
           posted++;
-        } catch {}
+        } catch (e) {
+          // Previously swallowed silently — which hid a broken/rotated SLACK_BOT_TOKEN
+          // as "posted:0" with no explanation. Capture it so a Slack failure (e.g.
+          // invalid_auth, not_in_channel, token_revoked) is visible in the response.
+          postErrors++;
+          lastPostError = String(e && e.message ? e.message : e);
+        }
       }
-      return res.status(200).json({ mode, posted, stats: st });
+      return res.status(200).json({ mode, openComputed: openNudges.length, posted, postErrors, lastPostError, stats: st });
     }
 
     // draft mode: DM Subhang this run's proposed nudges.
